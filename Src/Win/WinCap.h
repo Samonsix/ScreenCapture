@@ -1,5 +1,6 @@
 #pragma once
 #include <include/Ling.h>
+#include "OcrSelector.h"
 
 class CutMask;
 class ToolCap;
@@ -31,6 +32,7 @@ public:
 	void startPin();
 	void startLong();
 	void startVideo();
+	// 点击工具条上的 OCR 图标：进入 / 退出文字选取模式（不再交给外部插件）
 	void startOcr();
 	void startQrcode();
 	void saveToFile();
@@ -76,6 +78,16 @@ private:
 	void relayoutTool();
 	// 进长图 / 录屏阶段的公共动作：收掉底图与工具条，并提到最上层
 	void enterLiveStage();
+	// ---- 文字选取模式（OCR） ----
+	void enterOcrMode();
+	void exitOcrMode();
+	// 把当前选区交给后台 OCR。debounced 为 true 时只重置 500ms 防抖定时器，
+	// 拖动选区的过程中会连续进来，到点了才真的跑
+	void kickOcr(bool debounced);
+	// 工作线程的结果回调：转回 UI 线程并校验任务是否过期
+	void onOcrResult(UINT64 taskId, std::vector<OcrLine> lines);
+	// 客户区坐标 -> 选区内坐标（识别框的坐标系）
+	POINT toImgPos(const POINT& pos) const;
 	// 选区内的像素。BGRA、top-down、行紧凑，可以直接喂 Util 的存盘与剪切板
 	bool getCutPixels(std::vector<BYTE>& pixels, int& cw, int& ch);
 	std::tuple<int, int, int, int> getCMYK(const BYTE& r, const BYTE& g, const BYTE& b);
@@ -86,6 +98,13 @@ private:
 	std::unique_ptr<ToolCap> toolCap;
 	std::unique_ptr<CapLong> capLong;
 	std::unique_ptr<CapVideo> capVideo;
+	// 文字选取模式（OCR）：进入后选区拖动让位给文字划选，退出恢复
+	bool ocrMode{ false };
+	OcrSelector ocrSelector;
+	// 后台识别线程与任务编号：结果回来时对号入座，过期结果直接丢弃
+	OcrWorker ocrWorker;
+	UINT64 ocrTaskId{ 0 };
+	bool ocrPending{ false };
 	Microsoft::WRL::ComPtr<ID2D1Bitmap1> screenImg,pixImg;
 	D2D1_RECT_F pixSrcRect{};
 	// 铺满窗口的画布，走 swap chain 双缓冲：底图、蒙版、放大镜每帧都重画，

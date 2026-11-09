@@ -54,7 +54,11 @@
 
 ## Plugin Pengenalan Teks (OCR)
 
-Unduh versi terbaru alat pengenalan teks [ImageReader.exe](https://github.com/xland/ImageReader/releases) (sekitar 25MB), lalu letakkan file tersebut di direktori yang sama dengan ScreenCapture.exe, atau di direktori `%appdata%\ScreenCapture\plugin`, kemudian jalankan ulang aplikasi untuk menggunakannya.
+OCR offline bawaan ([PP-OCRv6](https://github.com/PaddlePaddle/PaddleOCR), model small dengan inferensi statis ncnn, mendukung bahasa Tionghoa, Inggris, dan Jepang). Tidak perlu lagi mengunduh plugin.
+
+- OCR berjalan otomatis di latar belakang begitu area dipilih. Klik ikon OCR pada toolbar untuk masuk ke mode pemilihan teks: kursor berubah menjadi I-beam di atas teks yang dikenali, tahan tombol kiri mouse dan seret untuk memilih, lalu salin melalui `Ctrl+C` atau menu konteks. Tekan `ESC` atau klik ikon sekali lagi untuk keluar.
+- Jendela pin juga mendukungnya: OCR dimulai otomatis saat pin dibuat; klik tombol OCR pada toolbarnya untuk masuk ke mode pemilihan teks.
+- File model dibaca dari sub-direktori `ocr` di sebelah ScreenCapture.exe (det.param/det.bin/rec.param/rec.bin/dict.txt). Skrip konversi lihat `Tools/build_ocr_models.py`; model juga dapat disematkan ke dalam exe dengan makro `OCR_EMBED_MODELS` saat kompilasi.
 
 ## Sponsor
 

@@ -6,6 +6,19 @@ icon.ttf RCDATA "iconfont.ttf"
 zh-CN RCDATA "../../Lang/简体中文.zh-CN.json"
 en-US RCDATA "../../Lang/English.en-US.json"
 
+// OCR 模型内嵌：默认不定义 OCR_EMBED_MODELS，构建不依赖模型文件（开发期从 exe
+// 同目录 ocr\ 文件夹读）。要把模型打进 exe 分发时，在 ResourceCompile 的
+// PreprocessorDefinitions 里加 OCR_EMBED_MODELS，并先用
+// Tools/build_ocr_models.py 生成下列文件（id 与 Ocr.cpp 里的 kRes* 常量一一对应）
+#ifdef OCR_EMBED_MODELS
+201 RCDATA "ocr/det.param"
+202 RCDATA "ocr/det.bin"
+203 RCDATA "ocr/rec.param"
+204 RCDATA "ocr/rec.bin"
+205 RCDATA "ocr/dict.txt"
+#endif
+
+
 // 配置可执行文件产品信息
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION 2,5,16,0

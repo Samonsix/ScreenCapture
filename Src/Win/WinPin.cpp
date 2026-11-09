@@ -91,6 +91,8 @@ void WinPin::onClosed()
 	// 防止 close() 被走两遍（比如按钮和快捷键先后触发）时排两次销毁
 	if (isClosed) return;
 	isClosed = true;
+	// 停掉后台识别线程（等当前帧跑完，几百毫秒），免得窗口没了结果还往回送
+	ocrWorker.stop();
 	if (editingText) editingText->finishEdit();
 	// 先收起附属窗口，再让出 hover 指针 —— shapeHover 指向 history 里的元素，
 	// history 随 WinPin 一起析构，留着悬空指针没意义
@@ -274,7 +276,13 @@ void WinPin::onCreated()
     d2d->deviceContext->CreateSolidColorBrush(D2D1::ColorF(0x1677ff), borderBrush.GetAddressOf());
     d2d->deviceContext->CreateSolidColorBrush(D2D1::ColorF(0x000000, 0.46f), brushTipBg.GetAddressOf());
     d2d->deviceContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), brushTipText.GetAddressOf());
+    // 后台识别线程：结果从工作线程回来，onOcrResult 里再转回 UI 线程
+    ocrWorker.start([this](UINT64 taskId, std::vector<OcrLine> lines) {
+        onOcrResult(taskId, std::move(lines));
+    });
     show();
+    // 贴图就是一张固定的底图，窗口一出来就把 OCR 跑上，用户点 OCR 按钮时结果多半已就绪
+    kickOcr();
 }
 
 void WinPin::layout()
@@ -299,10 +307,22 @@ void WinPin::layout()
 	if (!isMouseDown && shapeHover) {
 		shapeHover->paintDragger(ctx);
 	}
+	if (ocrMode) {
+		// 识别框与选中高亮都是底图像素坐标，当前还挂着缩放变换，直接画
+		ocrSelector.paint(ctx, 0.f, 0.f);
+	}
 	// 蓝边框和倍数提示属于窗口装饰，不跟着图缩放：变换收回来，按窗口坐标画。
 	// 边框也因此从"底图矩形"改成"窗口矩形"，任何倍数下都是 2*dpi 粗
 	ctx->SetTransform(D2D1::Matrix3x2F::Identity());
 	ctx->DrawRectangle(D2D1::RectF(0.f, 0.f, w, h), borderBrush.Get(), 2*dpi);
+	// "已复制"提示同样按窗口坐标画在选中区域左上角上方，别顶出窗口
+	if (ocrMode && ocrSelector.hasSelection()) {
+		auto tl = ocrSelector.selectionTopLeft();
+		auto tipX = tl.x * scale;
+		auto tipY = tl.y * scale - 24 * dpi;
+		if (tipY < 0) tipY = tl.y * scale + 24 * dpi;
+		ocrSelector.paintCopiedTip(ctx, tipX, tipY, dpi);
+	}
 	paintScaleTip(ctx);
     canvas->finishPaint();
 }
@@ -328,6 +348,15 @@ void WinPin::onDown(POINT pos, BOOL isRight)
 	// 这里不能抢先 SetCapture / 置 isMouseDown，否则拖选文本会被当成拖 shape。
 	if (editingText && textBox && textBox->isPosIn(pos)) return;
 	if (isRight) {
+		// 文字模式里右键不再切工具条，弹复制/全选菜单
+		if (ocrMode) {
+			POINT scr{};
+			GetCursorPos(&scr);
+			ocrSelector.showContextMenu(hwnd, scr);
+			refresh();
+			if (ocrSelector.copiedTipVisible()) setTimer(900, 102);
+			return;
+		}
 		// 右键在"有工具条"和"只剩图"这两个状态之间来回切。
 		// 藏着的时候（上一次右键收起来的）就把它请回来。位置先重排一遍：
 		// 藏着的这段时间里窗口可能被 Ctrl+滚轮缩放过，工具条的落点跟着变了
@@ -364,10 +393,22 @@ void WinPin::onDown(POINT pos, BOOL isRight)
 	// 这一下既不是画画也不是拖窗，不该留下 capture、更不该新建 shape。
 	// 编辑文字时不算：双击归文本框（选中单词），点在框外才会走到这里
 	if (isDblClick && !editingText) {
+		// 文字模式里双击变成"选中光标所在的整行"（复制整图并关窗的语义让位）
+		if (ocrMode) {
+			ocrSelector.dblClick(toImgPos(pos));
+			refresh();
+			return;
+		}
 		// 前半段那一下点击是这个手势的一部分，它顺手放下的元素（只有序号是按一下就成形的，
 		// 别的都在抬手时按"没画出东西"清掉了）不该被带进剪切板
 		if (prevPressCreatedShape) history->undo();
 		copyToClipboard();
+		return;
+	}
+	// 文字模式里左键是划选文字：窗口拖动、画画全部让位，也不抢 capture
+	if (ocrMode) {
+		ocrSelector.onDown(toImgPos(pos));
+		refresh();
 		return;
 	}
 	// 记的是按下点在窗口内的偏移（客户区坐标），拖动时用它把抓住的那一点保持在光标下
@@ -395,6 +436,12 @@ void WinPin::onMove(POINT pos)
 {
 	// 同 onDown：文本框里的移动归 TextBox（拖选、滚动条 hover），不参与 shape 的 hover 判定
 	if (editingText && textBox && textBox->isPosIn(pos)) return;
+	// 文字模式里按住拖动是划选文字
+	if (ocrMode) {
+		ocrSelector.onMove(toImgPos(pos));
+		refresh();
+		return;
+	}
 	// 拖窗口用的是窗口坐标（pressPos 也是），只有交给 shape 的才换算成底图像素
 	auto imgPos = toImgPos(pos);
 	if (isMouseDown) {
@@ -439,6 +486,12 @@ void WinPin::onUp(POINT pos, BOOL isRight)
 	// 更要紧的是不能往下走：下面那条"拖窗结束"的路会把 ToolMain 显示出来，
 	// 而右键刚刚才把它收起来 —— 一按一放就等于什么都没做
 	if (isRight) return;
+	// 文字模式里抬手收掉划选状态就行，没抓 capture 也没动 shape
+	if (ocrMode) {
+		ocrSelector.onUp(toImgPos(pos));
+		refresh();
+		return;
+	}
 	isMouseDown = false;
 	ReleaseCapture();
 	auto justCreated = newShape;
@@ -471,6 +524,11 @@ void WinPin::onUp(POINT pos, BOOL isRight)
 
 void WinPin::onTimerCB(UINT id)
 {
+	if (id == 102) { //"已复制"提示到点收掉
+		killTimer(102);
+		refresh();
+		return;
+	}
 	if (id == 101) { //缩放停手了，收掉右上角的倍数提示
 		killTimer(101);
 		scaleTip = nullptr;
@@ -514,6 +572,25 @@ void WinPin::onKey(UINT key)
 	// Delete 删掉的是整个 shape、ESC 直接把窗口关了。ESC 结束编辑由 TextBox 自己处理。
 	if (editingText) return;
 	bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+	// 文字模式里按键先归 OCR：ESC 退出模式，Ctrl+C 复制选中文字，Ctrl+A 全选。
+	// 其余按键（回车复制整图、Delete 删 shape、Ctrl+Z 撤销）全部吞掉
+	if (ocrMode) {
+		if (key == VK_ESCAPE) {
+			exitOcrMode();
+		}
+		else if (key == 'C' && ctrl) {
+			if (ocrSelector.copy()) {
+				ocrSelector.showCopiedTip();
+				refresh();
+				setTimer(900, 102);
+			}
+		}
+		else if (key == 'A' && ctrl) {
+			ocrSelector.selectAll();
+			refresh();
+		}
+		return;
+	}
 	if (ctrl && key == 'Z') {
 		history->undo();
 	}
@@ -653,8 +730,100 @@ bool WinPin::getImagePixels(std::vector<BYTE>& pixels, D2D1_SIZE_U& size)
 	return true;
 }
 
+// ---- 文字选取模式（OCR） ----
+// 识别在后台线程跑（见 Ocr.cpp）：贴图创建时就自动开跑（底图不变，只跑一次），
+// 这里只负责模式切换与交互。点击 ToolMain 上的 OCR 按钮走到这
+void WinPin::startOcr()
+{
+	// 有 shape 正在被 hover / 编辑时先不动，避免打断编辑状态
+	if (editingText) return;
+	if (ocrMode) exitOcrMode();
+	else enterOcrMode();
+}
+
+void WinPin::enterOcrMode()
+{
+	// 正选着画笔的话先收掉（ToolSub 跟着隐藏），文字模式期间画笔不可用
+	toolMain->cancelSelect();
+	ocrMode = true;
+	ocrSelector.clearSelection();
+	refresh();
+}
+
+void WinPin::exitOcrMode()
+{
+	ocrMode = false;
+	ocrSelector.clearSelection();
+	refresh();
+	// 右键 / 拖动收起的工具条在退出文字模式时请回来，回到正常标注状态
+	layoutTools();
+	toolMain->show();
+}
+
+void WinPin::kickOcr()
+{
+	if (ocrPending || !screenImg) return;
+	std::vector<BYTE> pixels;
+	D2D1_SIZE_U size{};
+	if (!getBasePixels(pixels, size)) return;
+	ocrPending = true;
+	++ocrTaskId;
+	ocrWorker.submit(ocrTaskId, std::move(pixels), (int)size.width, (int)size.height);
+}
+
+void WinPin::onOcrResult(UINT64 taskId, std::vector<OcrLine> lines)
+{
+	// 回调从工作线程来，转回 UI 线程。窗口可能已被关掉擦除，先验明正身
+	Ling::App::get()->dq.TryEnqueue([this, taskId, lines = std::move(lines)]() mutable {
+		auto it = std::find_if(winPins.begin(), winPins.end(),
+			[this](const std::unique_ptr<WinPin>& p) { return p.get() == this; });
+		if (it == winPins.end() || isClosed) return;
+		// 只提交过一轮任务，除非模型加载极慢用户关窗又贴了新图，否则不会过期
+		if (taskId != ocrTaskId) return;
+		ocrPending = false;
+		ocrSelector.setLines(std::move(lines));
+		refresh();
+	});
+}
+
+// 只读底图的像素（不走 getImagePixels：那边会带上所有标注，且文字编辑收尾会改状态）。
+// OCR 认的是钉图那一刻的原图，用户标注的箭头文字混进去反而添乱
+bool WinPin::getBasePixels(std::vector<BYTE>& pixels, D2D1_SIZE_U& size)
+{
+	size = getImgSize();
+	if (size.width == 0 || size.height == 0) return false;
+	auto ctx = Ling::D2D::get()->deviceContext.Get();
+	D2D1_BITMAP_PROPERTIES1 cpuProps{
+		.pixelFormat{ D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED) },
+		.dpiX{ 96.0f }, .dpiY{ 96.0f },
+		.bitmapOptions{ D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW }
+	};
+	ComPtr<ID2D1Bitmap1> cpuBmp;
+	if (FAILED(ctx->CreateBitmap(size, nullptr, 0, &cpuProps, cpuBmp.GetAddressOf()))) return false;
+	if (FAILED(cpuBmp->CopyFromBitmap(nullptr, screenImg.Get(), nullptr))) return false;
+	D2D1_MAPPED_RECT mapped{};
+	if (FAILED(cpuBmp->Map(D2D1_MAP_OPTIONS_READ, &mapped))) return false;
+	// mapped.pitch 按 GPU 行对齐，可能大于 w*4；OCR 引擎按行紧凑步长解释，逐行紧缩
+	const UINT32 rowBytes = size.width * 4;
+	pixels.resize((size_t)rowBytes * size.height);
+	for (UINT32 row = 0; row < size.height; ++row) {
+		CopyMemory(pixels.data() + (size_t)row * rowBytes,
+			mapped.bits + (size_t)row * mapped.pitch, rowBytes);
+	}
+	cpuBmp->Unmap();
+	return true;
+}
+
 BOOL WinPin::setCursor()
 {
+	// 文字模式：悬停到文字上变 I 型，其余地方普通箭头，不再出现"可拖动窗口"的四向箭头
+	if (ocrMode) {
+		POINT pos{};
+		GetCursorPos(&pos);
+		ScreenToClient(hwnd, &pos);
+		SetCursor(LoadCursor(nullptr, ocrSelector.hoverText(toImgPos(pos)) ? IDC_IBEAM : IDC_ARROW));
+		return TRUE;
+	}
 	// 编辑文本时光标形状交给 TextBox 决定（文本区 I 形、滚动条箭头）。
 	// 本函数覆写了基类且不调用它，TextBox 挂在 onCursor 上的那个订阅不会自己被触发，得手动发一次。
 	if (editingText) {

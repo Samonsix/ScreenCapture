@@ -13,7 +13,7 @@
 - 可以随时修改、删除已绘制的元素（鼠标移到元素上）。
 - 撤销（`Ctrl+Z`）、重做（`Ctrl+Y`）、保存为文件（`Ctrl+S`）、保存到剪贴板（`Ctrl+C`或双击）。
 - 运行速度快、内存占用低。
-- 体积小、仅一个可执行文件，无需安装，不依赖任何动态链接库（文字识别除外）。
+- 体积小、仅一个可执行文件，无需安装，不依赖任何动态链接库。
 - 支持多种命令行参数直接启动指定的功能。
 - 支持用完即走（进程不驻留在系统中）。
 - 多语言支持。
@@ -37,6 +37,7 @@
 
 - main分支依赖 [Ling](https://github.com/xland/Ling) GUI 框架.
 - 使用 Visual Studio 2026（With C++ Desktop Dev Kit）即可编译项目。
+- OCR 需要 [ncnn](https://github.com/Tencent/ncnn) 静态库（`-DNCNN_VULKAN=OFF -DNCNN_BUILD_TOOLS=ON`，/MT 运行时），放到 `D:\sdk\ncnn`；模型转换见 `Tools/build_ocr_models.py`。
 - [2.4.25（基于D2D）](https://github.com/xland/ScreenCapture/tree/2.4.25)或 [2.3.3（基于Qt）](https://github.com/xland/ScreenCapture/tree/2.3.3_qt)是以前的稳定分支。
 
 ## 命令行
@@ -52,7 +53,7 @@
 > ScreenCapture.exe --enter=long
 // video 屏幕录制
 > ScreenCapture.exe --enter=video
-// ocr 文字识别
+// ocr 文字识别（框选完成后点工具条上的 OCR 图标，或直接进入文字选取模式）
 > ScreenCapture.exe --enter=ocr
 // qr 二维码识别
 > ScreenCapture.exe --enter=qr
@@ -63,19 +64,23 @@
 > ScreenCapture.exe --enter=long --auto-quit=true
 ```
 
-## 文字识别插件
+## 文字识别
 
-下载最新版本的文字识别工具 [ImageReader.exe](https://github.com/xland/ImageReader/releases) (约25MB) 并把此文件放置到 `%appdata%\ScreenCapture\plugin`目录下，然后重启应用即可使用（或 `ScreenCapture.exe` 同目录下亦可）
+内置离线 OCR（[PP-OCRv6](https://github.com/PaddlePaddle/PaddleOCR) small 模型 + ncnn 静态推理，支持中、英、日），无需下载任何插件。
+
+- 框选完成后 OCR 在后台自动识别；点工具条上的 OCR 图标进入文字选取模式，鼠标在文字上变 I 型光标，按住左键划选即可复制（`Ctrl+C` 或右键菜单），`ESC` 或再次点击图标退出。
+- 贴图窗口同样支持：贴图创建即自动识别，点工具条上的 OCR 按钮进入文字选取模式。
+- 模型文件默认从 `ScreenCapture.exe` 同目录的 `ocr` 子目录读取（det.param/det.bin/rec.param/rec.bin/dict.txt）；模型转换脚本见 `Tools/build_ocr_models.py`，也可以在构建时以 `OCR_EMBED_MODELS` 宏把模型内嵌进 exe。
 
 ## 便携能力
 
-默认情况下 ScreenCapture 会从 `%appdata%\ScreenCapture\Lang` 目录下读取配置信息、语言文件及插件。
+默认情况下 ScreenCapture 会从 `%appdata%\ScreenCapture\Lang` 目录下读取配置信息及语言文件。
 
 但用户可以在 `ScreenCapture.exe` 同目录下创建一个 `config.json` 的空文件，重启应用，`ScreenCapture` 即会在此文件中设置配置信息。
 
 `ScreenCapture.exe` 同目录下创建一个 `Lang` 子目录，然后把语言文件放置到此目录下，`ScreenCapture` 即会读取此目录下的语言文件。
 
-文字识别插件 `ImageReader.exe` 也可以放置在 `ScreenCapture.exe` 同目录下
+OCR 模型也可以放置在 `ScreenCapture.exe` 同目录下的 `ocr` 子目录中
 
 ## 赞助
 

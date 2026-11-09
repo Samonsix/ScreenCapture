@@ -1,5 +1,6 @@
 #pragma once
 #include <include/Ling.h>
+#include "OcrSelector.h"
 
 class ToolMain;
 class ToolSub;
@@ -24,6 +25,8 @@ public:
 	void copyToClipboard();
 	// 弹另存为对话框，把合成结果存成 PNG，成功即关窗；用户取消或失败则保持窗口
 	void saveToFile();
+	// 点击 ToolMain 上的 OCR 按钮：进入 / 退出文字选取模式
+	void startOcr();
 	// 所有 ShapeText 共用的文本输入框，第一次用到时才建。
 	// 共用而不是一个 shape 一个：TextBox 构造时会往窗口的十来个事件上挂回调，
 	// N 个实例意味着每次鼠标移动都要跑 N 遍，而同一时刻只可能有一个 ShapeText 在编辑。
@@ -66,6 +69,14 @@ private:
 	// size 是出参，给的是底图的原始尺寸 —— 必须拿它去解释 pixels，不能用窗口的 w/h：
 	// Ctrl+滚轮缩放改的只有窗口大小，两者对不上就是按错误的宽高读缓冲区（越界崩溃、图也是花的）
 	bool getImagePixels(std::vector<BYTE>& pixels, D2D1_SIZE_U& size);
+	// 只读底图（不含 shape）的像素，喂给后台 OCR。同 getImagePixels，BGRA、top-down、行紧凑
+	bool getBasePixels(std::vector<BYTE>& pixels, D2D1_SIZE_U& size);
+	// ---- 文字选取模式（OCR） ----
+	void enterOcrMode();
+	void exitOcrMode();
+	// 把底图交给后台识别线程。钉图的底图不变，只需跑一次
+	void kickOcr();
+	void onOcrResult(UINT64 taskId, std::vector<OcrLine> lines);
 	// 另存为对话框会抢走前台并把 WinPin 激活，取消保存后用它把窗口层级和前台窗口恢复原样
 	void restoreWindowState(HWND foregroundBeforeDialog);
 	// 把窗口尺寸掰成"底图像素 × scale"。系统在 DPI 变化时会按新旧缩放比擅自缩放窗口
@@ -103,5 +114,12 @@ private:
 	// 上一次按下是不是新建了一个留得住的元素（现在只有序号：按一下就成形，
 	// 别的都在抬手时按"没画出东西"清掉了）。双击的前半段放下的东西不该被复制进剪切板
 	bool prevPressCreatedShape{ false };
+	// 文字选取模式（OCR）：进入后窗口拖动、画画让位给文字划选，退出恢复
+	bool ocrMode{ false };
+	OcrSelector ocrSelector;
+	// 后台识别线程。底图不会变，提交一次任务就够，taskId 只用于丢弃过期结果
+	OcrWorker ocrWorker;
+	UINT64 ocrTaskId{ 0 };
+	bool ocrPending{ false };
 };
 

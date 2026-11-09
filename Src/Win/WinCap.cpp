@@ -17,6 +17,9 @@ namespace
     constexpr float scaleNum{ 5.f }, srcW{ 50.f }, srcH{ 30.f };
     constexpr float pixImgH{ scaleNum * srcH };
     constexpr float pixW{ srcW * scaleNum };
+    // OCR 防抖与"已复制"提示的定时器 id。CapLong 借用本窗口的定时器用的是小数字（18/19），挑大值避开
+    constexpr UINT kOcrDebounceTimer{ 0x1001 };
+    constexpr UINT kOcrTipTimer{ 0x1002 };
 }
 
 std::unique_ptr<WinCap> winCap;
@@ -30,8 +33,18 @@ WinCap::WinCap() : Ling::WinBase()
     onMouseMove.add([this](POINT pos) { this->onMove(pos); });
     onMouseUp.add([this](POINT pos, bool isRight) { this->onUp(pos, isRight); });
     onKeyDown.add([this](UINT key) { this->onKey(key); });
-    // 滚动截图的定时器借的是本窗口的，转给 CapLong
-    onTimer.add([this](UINT id) { if (capLong) capLong->onTimerCB(id); });
+    // 滚动截图的定时器借的是本窗口的，转给 CapLong；OCR 防抖与提示定时器自己处理
+    onTimer.add([this](UINT id) {
+        if (id == kOcrDebounceTimer) {
+            killTimer(id);
+            kickOcr(false);
+        }
+        else if (id == kOcrTipTimer) {
+            killTimer(id);
+            refresh(); //"已复制"提示到点消失
+        }
+        else if (capLong) capLong->onTimerCB(id);
+    });
     onDestroy.add([this]() { this->onClosed(); });
     // DPI 变了（用户改了缩放比例）：系统会按新旧缩放比把窗口整体缩放一圈，但本窗口是铺满整个
     // 虚拟桌面的，缩放之后就盖不住桌面了，而且底图、选区（cutMask->maskRect）用的都是物理像素，
@@ -84,6 +97,10 @@ void WinCap::onCreated()
     d2d->deviceContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), brushText.GetAddressOf());
     d2d->deviceContext->CreateSolidColorBrush(D2D1::ColorF(0x000000, 0.56f), brushBg.GetAddressOf());
     d2d->deviceContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.5f, 1.f, 0.5f), crossBrush.GetAddressOf());
+    // 后台识别线程：结果从工作线程回来，onOcrResult 里再转回 UI 线程
+    ocrWorker.start([this](UINT64 taskId, std::vector<OcrLine> lines) {
+        onOcrResult(taskId, std::move(lines));
+    });
     POINT pos;
     GetCursorPos(&pos);
     ScreenToClient(hwnd, &pos);
@@ -104,6 +121,16 @@ void WinCap::layout()
         ctx->DrawBitmap(screenImg.Get(), destRect);
     }
     cutMask->paint(ctx);
+    if (ocrMode) {
+        // 识别框是选区内坐标，画高亮时平移回客户区
+        ocrSelector.paint(ctx, cutMask->maskRect.left, cutMask->maskRect.top);
+        // "已复制"提示画在选中区域左上角上方，别顶出屏幕
+        auto tl = ocrSelector.selectionTopLeft();
+        auto tipX = cutMask->maskRect.left + tl.x;
+        auto tipY = cutMask->maskRect.top + tl.y - 24 * dpi;
+        if (tipY < 0) tipY = cutMask->maskRect.top + tl.y + 24 * dpi;
+        ocrSelector.paintCopiedTip(ctx, tipX, tipY, dpi);
+    }
     if (capLong) capLong->paint(ctx);
     paintPix(ctx);
     canvas->finishPaint();
@@ -111,6 +138,14 @@ void WinCap::layout()
 
 BOOL WinCap::setCursor()
 {
+    // 文字选取模式：悬停到文字上变 I 型，其余地方普通箭头，不再出现选区的缩放/移动光标
+    if (ocrMode) {
+        POINT pos{};
+        GetCursorPos(&pos);
+        ScreenToClient(hwnd, &pos);
+        SetCursor(LoadCursor(nullptr, ocrSelector.hoverText(toImgPos(pos)) ? IDC_IBEAM : IDC_ARROW));
+        return TRUE;
+    }
     if (stage == CapStage::Select) {
         SetCursor(LoadCursor(nullptr, IDC_CROSS));
         return TRUE;
@@ -252,6 +287,26 @@ void WinCap::paintPix(ID2D1DeviceContext* ctx)
 
 void WinCap::onKey(UINT key)
 {
+    // 文字选取模式下按键先归 OCR：ESC 退出模式回到正常截图，Ctrl+C 复制选中文字，
+    // Ctrl+A 全选。其余按键（Enter/取色快捷键）全部吞掉，避免做出模式外的动作
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (ocrMode) {
+        if (key == VK_ESCAPE) {
+            exitOcrMode();
+        }
+        else if (key == 'C' && ctrl) {
+            if (ocrSelector.copy()) {
+                ocrSelector.showCopiedTip();
+                refresh();
+                setTimer(900, kOcrTipTimer);
+            }
+        }
+        else if (key == 'A' && ctrl) {
+            ocrSelector.selectAll();
+            refresh();
+        }
+        return;
+    }
     auto func = []() {
         POINT pos;
         GetCursorPos(&pos);
@@ -379,6 +434,15 @@ LRESULT WinCap::onHitTest(const POINT pos)
 void WinCap::onDown(POINT pos, bool isRight)
 {
     if (isRight) {
+        // 文字模式里右键不再关窗，弹复制/全选菜单
+        if (ocrMode) {
+            POINT scr{};
+            GetCursorPos(&scr);
+            ocrSelector.showContextMenu(hwnd, scr);
+            refresh();
+            if (ocrSelector.copiedTipVisible()) setTimer(900, kOcrTipTimer);
+            return;
+        }
         close();
         return;
     }
@@ -391,6 +455,12 @@ void WinCap::onDown(POINT pos, bool isRight)
         && std::abs(pos.y - lastDownPos.y) <= GetSystemMetrics(SM_CYDOUBLECLK);
     lastDownTime = now;
     lastDownPos = pos;
+    // 文字模式里双击变成"选中光标所在的整行"（原图双击复制整图的语义让位）
+    if (ocrMode && isDblClick && stage == CapStage::Adjust) {
+        ocrSelector.dblClick(toImgPos(pos));
+        refresh();
+        return;
+    }
     if (isDblClick && stage == CapStage::Adjust) {
         copyToClipboard();
         return;
@@ -400,6 +470,12 @@ void WinCap::onDown(POINT pos, bool isRight)
         cutMask->startMakeRect(pos);
     }
     else if (stage == CapStage::Adjust) {
+        // 文字模式里左键是划选文字，选区拖动让位
+        if (ocrMode) {
+            isPress = true;
+            ocrSelector.onDown(toImgPos(pos));
+            return;
+        }
         // 选区外面按下不是重新框选，而是按落点所在的那一块调对应的边或角
         isPress = true;
         cutMask->startAdjust(pos);
@@ -421,9 +497,15 @@ void WinCap::onMove(POINT pos)
         }
     }
     else if (stage == CapStage::Adjust) {
+        // 文字模式里按住拖动是划选文字
+        if (ocrMode) {
+            if (isPress && ocrSelector.onMove(toImgPos(pos))) refresh();
+            return;
+        }
         if (!isPress) return;
         cutMask->adjust(pos);
-        // 选区变了，工具条跟着走位
+        // 选区变了，工具条跟着走位；同时重置 OCR 防抖，停手后再重跑识别
+        kickOcr(true);
         layoutTool(toolCap.get());
     }
     else if (stage == CapStage::Long && capLong) {
@@ -448,9 +530,12 @@ void WinCap::onUp(POINT pos, bool isRight)
         stage = CapStage::Adjust;
         refresh();  // 收掉放大镜
         makeToolCap();
+        // 框选完成就开始后台识别，点 OCR 图标时结果多半已经就绪
+        kickOcr(false);
     }
     else if (stage == CapStage::Adjust) {
         isPress = false;
+        if (ocrMode) ocrSelector.onUp(toImgPos(pos));
     }
     else if (stage == CapStage::Long && capLong) {
         capLong->onUp(pos);
@@ -464,6 +549,8 @@ void WinCap::onClosed()
 {
     if (isClosed) return;
     isClosed = true;
+    // 停掉后台识别线程（等当前帧跑完，几百毫秒），免得窗口没了结果还往回送
+    ocrWorker.stop();
     if (capVideo) capVideo->dispose();
     if (capLong) capLong->dispose();
     if (toolCap) toolCap->close();
@@ -695,15 +782,71 @@ void WinCap::setMouseTransparent(bool transparent)
     SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
-// 文字识别由外部插件进程来做，这边只负责把选区里的像素递过去
+// ---- 文字选取模式（OCR） ----
+// 识别在后台线程跑（见 Ocr.cpp）：框选完成即自动开跑、选区变动后防抖重跑，
+// 这里只负责模式切换与交互。点击工具条 OCR 图标（或 --enter=ocr 直通路径）都会走到这
 void WinCap::startOcr()
 {
+    if (stage != CapStage::Adjust || !cutMask->hasRect()) return;
+    if (ocrMode) exitOcrMode();
+    else enterOcrMode();
+}
+
+void WinCap::enterOcrMode()
+{
+    ocrMode = true;
+    ocrSelector.clearSelection();
+    // 结果还没到位就先补跑一轮；已经在跑或已有结果就不再浪费 CPU
+    if (ocrSelector.empty() && !ocrPending) kickOcr(false);
+    refresh();
+}
+
+void WinCap::exitOcrMode()
+{
+    ocrMode = false;
+    ocrSelector.clearSelection();
+    refresh();
+    // --enter=ocr 直通路径进来时没有工具条，退出文字模式得把它请出来，
+    // 让用户回到可以继续调整选区的正常截图状态
+    makeToolCap();
+}
+
+void WinCap::kickOcr(bool debounced)
+{
+    if (stage != CapStage::Adjust || !cutMask->hasRect()) return;
+    if (debounced) {
+        // 防抖：同一个 id 反复 setTimer 就是重新计时，停下 500ms 后才真的识别
+        setTimer(500, kOcrDebounceTimer);
+        return;
+    }
+    if (ocrPending) return;
     std::vector<BYTE> pixels;
     int cw{ 0 }, ch{ 0 };
     if (!getCutPixels(pixels, cw, ch)) return;
-    // 插件缺失时 openWithImageReader 会打开下载页，同样得让位，所以不看返回值
-    Util::openWithImageReader(cw, ch, pixels.data());
-    close();
+    ocrPending = true;
+    ++ocrTaskId;
+    // 像素整份移交，工作线程里跑模型，不占 UI 线程
+    ocrWorker.submit(ocrTaskId, std::move(pixels), cw, ch);
+}
+
+void WinCap::onOcrResult(UINT64 taskId, std::vector<OcrLine> lines)
+{
+    // 回调从工作线程来，转回 UI 线程。winCap 单例可能已被 reset，先验明正身再动手
+    Ling::App::get()->dq.TryEnqueue([this, taskId, lines = std::move(lines)]() mutable {
+        if (WinCap::get() != this || isClosed) return;
+        // 识别期间选区又变了：这批过期。新一轮已提交（ocrPending 还挂着），由它自己来清
+        if (taskId != ocrTaskId) return;
+        ocrPending = false;
+        if (stage != CapStage::Adjust) return;
+        ocrSelector.setLines(std::move(lines));
+        refresh();
+    });
+}
+
+POINT WinCap::toImgPos(const POINT& pos) const
+{
+    // 识别框的坐标系是选区内左上角原点
+    return POINT{ pos.x - (int)cutMask->maskRect.left, pos.y - (int)cutMask->maskRect.top };
 }
 
 void WinCap::startQrcode()

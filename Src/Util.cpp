@@ -60,18 +60,6 @@ namespace {
 		return convert(dataType == QUIRC_DATA_TYPE_KANJI ? 932 : CP_ACP, 0);
 	}
 
-	// 插件的查找顺序：先本 exe 同目录（绿色包一起解压的情况），
-	// 再 %appdata%\ScreenCapture\plugin（后来单独下载的情况）
-	std::filesystem::path findImageReader()
-	{
-		wchar_t buffer[MAX_PATH]{};
-		GetModuleFileName(nullptr, buffer, MAX_PATH);
-		auto path = std::filesystem::path{ buffer }.parent_path().append(L"ImageReader.exe");
-		if (std::filesystem::exists(path)) return path;
-		path = Setting::get()->getDataPath().append(L"plugin").append(L"ImageReader.exe");
-		if (std::filesystem::exists(path)) return path;
-		return {};
-	}
 }
 
 void Util::saveToClipboard(const int w, const int h, BYTE* data)
@@ -285,32 +273,6 @@ void Util::addFileToClipboard(const std::wstring& filePath)
 		GlobalFree(hGlobal);
 	}
 	CloseClipboard();
-}
-
-bool Util::openWithImageReader(const int w, const int h, BYTE* data)
-{
-	auto exePath = findImageReader();
-	if (exePath.empty()) {
-		// 插件没装，直接把用户带到下载页，不再多弹一层提示
-		ShellExecute(nullptr, L"open", L"https://github.com/xland/ImageReader/releases", nullptr, nullptr, SW_SHOWNORMAL);
-		return false;
-	}
-	auto imgPath = Setting::get()->getDataPath().append(L"ocr_" + createFileName(L"png")).wstring();
-	if (!saveToFile(imgPath, w, h, data)) return false;
-	// --del-image=true：插件读完自己把缓存图删掉，免得在数据目录里越攒越多
-	auto cmd = std::format(L"\"{}\" --image-path=\"{}\" --del-image=true", exePath.wstring(), imgPath);
-	// 工作目录设成插件所在目录，它才找得到自己身边的依赖
-	auto workDir = exePath.parent_path().wstring();
-	STARTUPINFO si{ .cb = sizeof(STARTUPINFO) };
-	PROCESS_INFORMATION pi{};
-	if (!CreateProcess(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, workDir.data(), &si, &pi)) {
-		std::error_code ec;
-		std::filesystem::remove(imgPath, ec); //插件没起来，别留下垃圾文件
-		return false;
-	}
-	CloseHandle(pi.hThread);
-	CloseHandle(pi.hProcess);
-	return true;
 }
 
 std::wstring Util::decodeQrCode(const int w, const int h, BYTE* data)
